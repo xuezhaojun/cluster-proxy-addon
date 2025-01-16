@@ -9,11 +9,16 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/stolostron/cluster-proxy-addon/pkg/constant"
 	"github.com/stolostron/cluster-proxy-addon/pkg/utils"
+	authenticationv1 "k8s.io/api/authentication/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog/v2"
 	addonutils "open-cluster-management.io/addon-framework/pkg/utils"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -44,6 +49,10 @@ type serviceProxy struct {
 	idleConnTimeout       time.Duration
 	tLSHandshakeTimeout   time.Duration
 	expectContinueTimeout time.Duration
+
+	hubKubeConfig string
+	hubKubeClient kubernetes.Interface
+	ValidToken    map[string]string
 }
 
 func newServiceProxy() *serviceProxy {
@@ -56,6 +65,9 @@ func (s *serviceProxy) AddFlags(cmd *cobra.Command) {
 	flags.StringVar(&s.cert, "cert", s.cert, "The path to the certificate of the service proxy server")
 	flags.StringVar(&s.key, "key", s.key, "The path to the key of the service proxy server")
 	flags.StringVar(&s.ocpserviceCA, "ocpservice-ca", s.ocpserviceCA, "The path to the CA certificate of the ocp services")
+
+	// hubKubeConfig is the kubeconfig file for connecting to the hub cluster
+	flags.StringVar(&s.hubKubeConfig, "hub-kubeconfig", "", "The kubeconfig file for connecting to the hub cluster")
 
 	// proxy related flags
 	flags.IntVar(&s.maxIdleConns, "max-idle-conns", 100, "The maximum number of idle (keep-alive) connections across all hosts.")
@@ -109,6 +121,16 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 		customChecks = append(customChecks, cc.Check)
 	}
 
+	// get hubKubeConfig
+	restConfig, err := clientcmd.BuildConfigFromFlags("", s.hubKubeConfig)
+	if err != nil {
+		return err
+	}
+	s.hubKubeClient, err = kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return err
+	}
+
 	go func() {
 		if err = utils.ServeHealthProbes(":8000", customChecks...); err != nil {
 			klog.Fatal(err)
@@ -135,6 +157,26 @@ func (s *serviceProxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		}
 		klog.V(4).Infof("request:\n %s", string(dump))
 	}
+
+	// check token and get username
+	valid, userName, err := s.tokenCheck(strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer "))
+	if err != nil {
+		http.Error(wr, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if !valid {
+		http.Error(wr, "token is not authenticated", http.StatusUnauthorized)
+		return
+	}
+	req.Header.Set("Impersonate-User", fmt.Sprintf("cluster:hub:%s", userName))
+
+	// replace the original token with cluster-proxy service-account serviceaccount token which has impersonate permission
+	token, err := s.getImpersonateToken()
+	if err != nil {
+		http.Error(wr, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	url, err := utils.GetTargetServiceURLFromRequest(req)
 	if err != nil {
@@ -173,4 +215,35 @@ func (s *serviceProxy) validate() error {
 		return fmt.Errorf("key is required")
 	}
 	return nil
+}
+
+func (s *serviceProxy) tokenCheck(token string) (bool, string, error) {
+	if userName, ok := s.ValidToken[token]; ok {
+		return true, userName, nil
+	}
+
+	tokenReview, err := s.hubKubeClient.AuthenticationV1().TokenReviews().Create(context.Background(), &authenticationv1.TokenReview{
+		Spec: authenticationv1.TokenReviewSpec{
+			Token: token,
+		},
+	}, metav1.CreateOptions{})
+	if err != nil {
+		return false, "", err
+	}
+
+	if !tokenReview.Status.Authenticated {
+		return false, "", nil
+	}
+
+	s.ValidToken[token] = tokenReview.Status.User.Username
+	return true, tokenReview.Status.User.Username, nil
+}
+
+func (s *serviceProxy) getImpersonateToken() (string, error) {
+	// Read the latest token from the mounted file
+	token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err != nil {
+		return "", err
+	}
+	return string(token), nil
 }
