@@ -265,8 +265,17 @@ Both `curl` commands should return the result successfully.
 
 On the hub cluster, get token of serviceaccount "test-sa":
 
+For Kubernetes 1.24+:
+
 ```bash
 SA_TOKEN=$(oc create token test-sa -n test)
+```
+
+For Kubernetes 1.23 and below:
+
+```bash
+SECRET_NAME=$(oc get serviceaccount test-sa -n test -o jsonpath='{.secrets[0].name}')
+SA_TOKEN=$(oc get secret $SECRET_NAME -n test -o jsonpath='{.data.token}' | base64 -d)
 ```
 
 Then, list services of cluster1 via cluster-proxy-addon endpoint:
